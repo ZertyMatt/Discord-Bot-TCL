@@ -8,11 +8,11 @@ import logging
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from pathlib import Path
 
+import aiohttp
 import discord
+from aiohttp import web
 from discord import app_commands
-from discord.ext import commands
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
@@ -23,12 +23,21 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
-import aiohttp
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    TypeHandler,
+)
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot")
+# httpx écrit l'URL complète des requêtes Telegram (donc le token) en INFO : on le coupe
+for _name in ("httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
@@ -43,7 +52,6 @@ GRAND_LYON_URL = (
 )
 
 TZ = ZoneInfo("Europe/Paris")
-STATE_FILE = Path("state.json")
 POLL_INTERVAL_SECONDS = 60
 
 # Lignes TCL valides (819 codes, source : Liste_pictogrammes_lignes.csv de Grand Lyon).
@@ -133,20 +141,10 @@ JD972 JD973 JD974 JD975 JD976 JD977 JD978 JD979 JD980 JD981 JD982 JD983 JD984 JD
 JD988 JD989 JD990 JD991 JD992 JD993 JD994 JD995 JD996 JD997 JD998 JD999
 """.split())
 
+# Client Discord minimal : pas de commandes "!", pas de cache de messages.
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-# ---------- Persistance de l'état (perturbations déjà postées) ----------
-
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {}
-
-
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+bot = discord.Client(intents=intents, max_messages=None, chunk_guilds_at_startup=False)
+tree = app_commands.CommandTree(bot)
 
 
 # ---------- Mise en forme des messages ----------
@@ -189,12 +187,6 @@ _CHRONO_RE = re.compile(r"^C(\d+)$")  # C1, C2, ... — à ne pas confondre avec
 _PLEINE_LUNE_RE = re.compile(r"^PL(\d+)$")  # PL1, PL2, ...
 _NAVETTE_RE = re.compile(r"^N(\d+)$")  # N180 à N197
 
-
-_CATEGORY_ORDER = [
-    "Métro", "Tram", "TramBus", "Ligne Chrono", "Pleine Lune", "Navette",
-    "Rhônexpress", "Autres lignes",
-]
-# Funiculaire, relais et JD ajoutés pour le tri de l'autocomplete (/lines les affiche aussi)
 _CATEGORY_ORDER = [
     "Métro", "Funiculaire", "Tram", "TramBus", "Ligne Chrono", "Pleine Lune", "Navette",
     "Rhônexpress", "Autres lignes", "Bus relais", "Lignes JD",
@@ -284,6 +276,7 @@ def _html_to_discord_text(text: str) -> str:
     - retire le balisage HTML restant et décode les entités."""
     if not text:
         return ""
+
     def _link_to_text(m: re.Match) -> str:
         url = (m.group(1) or m.group(2) or m.group(3) or "").strip()
         label = _ANY_TAG_RE.sub("", m.group(4)).strip()
@@ -314,7 +307,6 @@ _MOIS_FR = {
     1: "janvier", 2: "février", 3: "mars", 4: "avril", 5: "mai", 6: "juin",
     7: "juillet", 8: "août", 9: "septembre", 10: "octobre", 11: "novembre", 12: "décembre",
 }
-
 
 _ANNEE_SENTINELLE = 2090  # au-delà, l'API utilise une date lointaine pour dire "indéterminé"
 
@@ -380,8 +372,7 @@ def _build_disruption_period_text(entry: dict) -> str:
 
 
 def _build_disruption_detail_text(entry: dict) -> str:
-    """Détail complet d'une perturbation (texte + période), SANS le label de
-    ligne. Utilisé par le message complet (_build_disruption_text)."""
+    """Détail complet d'une perturbation (texte + période), SANS le label de ligne."""
     body = _build_disruption_body_text(entry)
     periode = _build_disruption_period_text(entry)
     return f"{body}\n{periode}" if body else periode
@@ -389,8 +380,7 @@ def _build_disruption_detail_text(entry: dict) -> str:
 
 def _build_disruption_text(entry: dict, ligne: str) -> str:
     """Texte complet d'une perturbation, avec son label de ligne en tête —
-    utilisé pour les posts automatiques dans le canal (une perturbation =
-    un message)."""
+    utilisé pour les posts automatiques (une perturbation = un message)."""
     label = _format_line_label(ligne)
     detail = _build_disruption_detail_text(entry)
     return f"🚦 **{label}**\n{detail}"
@@ -398,20 +388,26 @@ def _build_disruption_text(entry: dict, ligne: str) -> str:
 
 # ---------- Récupération des perturbations Grand Lyon ----------
 
+_session: aiohttp.ClientSession | None = None  # session HTTP réutilisée (pas une par appel)
+
+
 async def _fetch_disruptions_uncached() -> list[dict]:
     """
     Interroge l'API Grand Lyon (dataset tcl_sytral.tclalertetrafic_2).
-    Retourne une liste de dicts : {"id": str, "ligne": str, "message": str}.
-    L'id est un hash du contenu stable de la perturbation (pas de vrai id
-    unique fourni par l'API) : si le contenu change, l'id change aussi,
-    ce qui déclenche un nouveau post.
+    Retourne une liste de dicts. L'id est un hash du contenu stable de la
+    perturbation (pas de vrai id unique fourni par l'API) : si le contenu
+    change, l'id change aussi, ce qui déclenche un nouveau post.
     """
-    auth = aiohttp.BasicAuth(GRAND_LYON_USER, GRAND_LYON_PASSWORD)
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(
+            auth=aiohttp.BasicAuth(GRAND_LYON_USER, GRAND_LYON_PASSWORD),
+            timeout=aiohttp.ClientTimeout(total=20),
+        )
 
-    async with aiohttp.ClientSession(auth=auth) as session:
-        async with session.get(GRAND_LYON_URL) as response:
-            response.raise_for_status()
-            payload = await response.json()
+    async with _session.get(GRAND_LYON_URL) as response:
+        response.raise_for_status()
+        payload = await response.json()
 
     disruptions = []
     for entry in payload.get("values", []):
@@ -467,7 +463,7 @@ async def fetch_disruptions() -> list[dict]:
         return list(data)
 
 
-# ---------- Gestion des rôles d'abonnement par ligne ----------
+# ---------- Gestion des rôles d'abonnement par ligne (Discord) ----------
 
 async def get_or_create_line_role(guild: discord.Guild, line: str) -> discord.Role:
     role_name = f"TCL-{line}"
@@ -490,21 +486,22 @@ def is_quiet_period(now: datetime) -> bool:
     return 0 <= now.hour < 5
 
 
+# Perturbations déjà postées sur Discord : en mémoire uniquement (le baseline
+# est refait à chaque démarrage, donc aucun fichier à persister).
+_discord_seen: set[str] = set()
+
+
 async def initialize_baseline() -> None:
-    """Exécuté une fois à CHAQUE démarrage du bot (pas seulement le tout
-    premier lancement) : mémorise les perturbations actuellement en cours
-    sans les poster, pour qu'un redémarrage ne spamme jamais le canal avec
-    l'existant. Seules les perturbations apparues ou modifiées après ce
-    point seront postées par check_traffic_updates."""
+    """Exécuté à CHAQUE démarrage : mémorise les perturbations en cours sans
+    les poster, pour qu'un redémarrage ne spamme jamais le canal."""
     try:
         disruptions = await fetch_disruptions()
     except Exception as error:
-        print(f"[fetch_disruptions] erreur à l'initialisation : {error}")
+        log.warning("[fetch_disruptions] erreur à l'initialisation : %s", error)
         return
-
-    seen_ids = {d["id"] for d in disruptions}
-    save_state({"seen_ids": list(seen_ids)})
-    print(f"Initialisation : {len(seen_ids)} perturbations existantes ignorées (pas de spam au démarrage).")
+    _discord_seen.clear()
+    _discord_seen.update(d["id"] for d in disruptions)
+    log.info("Initialisation : %d perturbations existantes ignorées (pas de spam au démarrage).", len(_discord_seen))
 
 
 async def poll_loop() -> None:
@@ -527,31 +524,24 @@ async def poll_loop() -> None:
 
 
 async def check_traffic_updates(channel: discord.TextChannel) -> None:
-    print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M:%S}] Vérification des perturbations TCL...")
-
-    state = load_state()
-    seen_ids = set(state.get("seen_ids", []))
-
     try:
         disruptions = await fetch_disruptions()
     except Exception as error:
-        print(f"[fetch_disruptions] erreur : {error}")
+        log.warning("[fetch_disruptions] erreur : %s", error)
         return
 
-    for disruption in disruptions:
-        if disruption["id"] in seen_ids:
-            continue  # déjà vu, rien de nouveau
+    new = [d for d in disruptions if d["id"] not in _discord_seen]
+    # on ne garde que les perturbations encore en cours : le set ne grossit jamais
+    _discord_seen.clear()
+    _discord_seen.update(d["id"] for d in disruptions)
 
-        seen_ids.add(disruption["id"])
-        role = discord.utils.get(channel.guild.roles, name=f"TCL-{disruption['ligne']}")
+    for d in new:
+        role = discord.utils.get(channel.guild.roles, name=f"TCL-{d['ligne']}")
         mention = role.mention if role else ""
-
         await channel.send(
-            f"{mention}\n{disruption['message']}".strip(),
+            f"{mention}\n{d['message']}".strip(),
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
-
-    save_state({"seen_ids": list(seen_ids)})
 
 
 # ---------- Slash commands ----------
@@ -600,7 +590,7 @@ async def subscribed_autocomplete(interaction: discord.Interaction, current: str
     ][:25]
 
 
-@bot.tree.command(
+@tree.command(
     name="sub",
     description="Voir tes abonnements (sans option), ou en ajouter (add) / retirer (rmv)",
 )
@@ -781,7 +771,7 @@ def _format_disruptions_grouped(disruptions: list[dict], max_len: int = 1900) ->
     return chunks
 
 
-@bot.tree.command(
+@tree.command(
     name="traffic",
     description="Lire les perturbations en cours d'une ligne, ou de tes lignes abonnées si aucune n'est précisée",
 )
@@ -828,12 +818,11 @@ async def traffic(interaction: discord.Interaction, ligne: str = None):
         )
         return
 
-    chunks = _format_disruptions_grouped(matching)
-    for chunk in chunks:
+    for chunk in _format_disruptions_grouped(matching):
         await interaction.followup.send(chunk, ephemeral=True)
 
 
-@bot.tree.command(
+@tree.command(
     name="lines",
     description="Lister les lignes TCL actuellement perturbées, triées par type de ligne",
 )
@@ -872,7 +861,7 @@ async def lines_cmd(interaction: discord.Interaction):
     await interaction.followup.send(message, ephemeral=True)
 
 
-@bot.tree.command(name="test_last_alert", description="(test) Poste tout de suite la dernière perturbation TCL mise à jour")
+@tree.command(name="test_last_alert", description="(test) Poste tout de suite la dernière perturbation TCL mise à jour")
 async def test_last_alert(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
@@ -898,155 +887,110 @@ async def test_last_alert(interaction: discord.Interaction):
 #  reçoit toutes les alertes). Sans TELEGRAM_TOKEN, seul Discord démarre.
 # ======================================================================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("telegram")
-# httpx écrit l'URL complète des requêtes Telegram (donc le token) en INFO : on le coupe
-for _name in ("httpx", "httpcore"):
-    logging.getLogger(_name).setLevel(logging.WARNING)
-
-TG_STATE_FILE = Path("telegram_state.json")  # distinct de state.json (Discord)
 TG_MAX_LEN = 3500  # < 4096 (limite Telegram), marge pour le balisage HTML
 _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
-
-# ---------- État : perturbations déjà vues + abonnements ----------
-
-def tg_load_state() -> dict:
-    if TG_STATE_FILE.exists():
-        return json.loads(TG_STATE_FILE.read_text(encoding="utf-8"))
-    return {}
+tg_app: Application | None = None
+_tg_seen: set[str] = set()  # perturbations déjà envoyées (mémoire uniquement)
 
 
-def tg_save_state(state: dict) -> None:
-    TG_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    _tg_mark_dirty(state)
+# ---------- Abonnements : en mémoire + message épinglé DANS la conversation ----------
+# Chaque chat (privé ou groupe) garde ses propres abonnements dans un message épinglé
+# "🔔 Abonnements TCL : C1, T2". Aucun canal/groupe de stockage séparé.
+# Au démarrage, un chat est relu à sa première interaction (commande ou bouton) :
+# Telegram ne permet pas de lister les chats d'un bot.
+# Dans un groupe, le bot doit pouvoir épingler des messages.
+
+SUBS_HEADER = "🔔 Abonnements TCL :"
+_subs: dict[int, list[str]] = {}   # chat_id -> lignes
+_pin_ids: dict[int, int] = {}      # chat_id -> id du message épinglé
+_loaded: set[int] = set()          # chats déjà relus depuis leur message épinglé
+_dirty: set[int] = set()           # chats à sauvegarder
 
 
 def get_subs(chat_id: int) -> list[str]:
-    subs = tg_load_state().get("subs", {}).get(str(chat_id), [])
-    return sorted(subs, key=_natural_sort_key)
+    return _subs.get(chat_id, [])
 
 
 def set_subs(chat_id: int, lines: list[str]) -> None:
-    state = tg_load_state()
-    subs = state.setdefault("subs", {})
     if lines:
-        subs[str(chat_id)] = sorted(set(lines), key=_natural_sort_key)
+        _subs[chat_id] = sorted(set(lines), key=_natural_sort_key)
     else:
-        subs.pop(str(chat_id), None)
-    tg_save_state(state)
+        _subs.pop(chat_id, None)
+    _dirty.add(chat_id)
 
 
-# ---------- Persistance des abonnements : message épinglé dans un chat Telegram privé ----------
-# Render gratuit efface les fichiers à chaque redéploiement. Les abonnements sont donc aussi
-# recopiés dans UN message épinglé d'un chat (canal privé) dont l'id est dans
-# TELEGRAM_STORAGE_CHAT_ID ; au démarrage le bot le relit et restaure tout.
-# Sans cette variable, les abonnements restent dans le fichier local (non persistants sur Render).
-
-_tg_storage_msg_id: int | None = None
-_tg_pushed: str | None = None  # dernier contenu envoyé dans le message de stockage
-_tg_dirty = asyncio.Event()
+def _subs_text(chat_id: int) -> str:
+    subs = get_subs(chat_id)
+    return f"{SUBS_HEADER} {', '.join(subs) if subs else 'aucun'}"
 
 
-def _storage_chat():
-    raw = os.environ.get("TELEGRAM_STORAGE_CHAT_ID", "").strip()
-    if not raw:
+def _parse_subs(text: str | None) -> list[str] | None:
+    """Texte du message épinglé -> lignes, ou None si ce n'est pas notre message."""
+    if not text or not text.startswith(SUBS_HEADER):
         return None
-    return int(raw) if raw.lstrip("-").isdigit() else raw
+    rest = text[len(SUBS_HEADER):].strip()
+    return [] if rest == "aucun" else [l for l in re.split(r"[,\s]+", rest.upper()) if l]
 
 
-def _subs_payload(state: dict) -> str:
-    return json.dumps(
-        {"v": 1, "subs": state.get("subs", {})},
-        ensure_ascii=False, separators=(",", ":"), sort_keys=True,
-    )
-
-
-def _parse_storage(text: str) -> dict | None:
-    """Contenu du message épinglé -> dict, ou None si ce n'est pas notre message de stockage."""
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) and data.get("v") == 1 and "subs" in data else None
-
-
-def _tg_mark_dirty(state: dict) -> None:
-    if _tg_storage_msg_id is not None and _subs_payload(state) != _tg_pushed:
-        _tg_dirty.set()
-
-
-async def _tg_create_storage_message(bot, payload: str) -> None:
-    global _tg_storage_msg_id, _tg_pushed
-    chat_id = _storage_chat()
-    msg = await bot.send_message(chat_id, payload)
-    try:
-        await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
-    except TelegramError:
-        log.exception("Épinglage impossible : le bot doit pouvoir épingler (canal : droit « Modifier les "
-                      "messages des autres » ; groupe : « Épingler des messages ») — sinon les abonnements "
-                      "ne seront pas restaurés au prochain démarrage")
-    _tg_storage_msg_id = msg.message_id
-    _tg_pushed = payload
-
-
-async def tg_pull_subs(bot) -> None:
-    """Au démarrage : restaure les abonnements depuis le message épinglé (ou le crée)."""
-    global _tg_storage_msg_id, _tg_pushed
-    chat_id = _storage_chat()
-    if chat_id is None:
-        log.warning("TELEGRAM_STORAGE_CHAT_ID absent : abonnements perdus à chaque redéploiement")
+async def tg_load_chat(bot_, chat_id: int) -> None:
+    """Relit le message épinglé de CE chat (une seule fois par démarrage)."""
+    if chat_id in _loaded:
         return
+    _loaded.add(chat_id)
     try:
-        chat = await bot.get_chat(chat_id)
-        pinned = chat.pinned_message
-        data = _parse_storage(pinned.text) if pinned is not None and pinned.text else None
-        if data is not None:
-            _tg_storage_msg_id = pinned.message_id
-            _tg_pushed = pinned.text
-            state = tg_load_state()
-            state["subs"] = data.get("subs", {})
-            tg_save_state(state)
-            log.info("Abonnements restaurés : %d chat(s)", len(state["subs"]))
-        else:
-            await _tg_create_storage_message(bot, _subs_payload(tg_load_state()))
-            log.info("Message de stockage créé et épinglé")
-    except Exception:
-        log.exception("Stockage Telegram indisponible : abonnements non persistants")
-        _tg_storage_msg_id = None
+        pinned = (await bot_.get_chat(chat_id)).pinned_message
+    except TelegramError:
+        return
+    subs = _parse_subs(pinned.text) if pinned else None
+    if subs is not None:
+        _pin_ids[chat_id] = pinned.message_id
+        if chat_id not in _subs and subs:
+            _subs[chat_id] = sorted(set(subs), key=_natural_sort_key)
 
 
-async def tg_storage_worker(bot) -> None:
-    """Recopie les abonnements dans le message épinglé dès qu'ils changent."""
-    global _tg_pushed
-    while True:
-        await _tg_dirty.wait()
-        await asyncio.sleep(1)  # regroupe les modifications rapprochées
-        _tg_dirty.clear()
-        if _tg_storage_msg_id is None:
-            continue
-        payload = _subs_payload(tg_load_state())
-        if payload == _tg_pushed:
-            continue
-        if len(payload) > 4000:
-            log.error("Abonnements trop volumineux pour un message Telegram (%d car.)", len(payload))
-            continue
+async def _tg_save_chat(bot_, chat_id: int) -> None:
+    if not get_subs(chat_id) and chat_id not in _pin_ids:
+        return  # rien à sauvegarder, rien à effacer
+    text, mid = _subs_text(chat_id), _pin_ids.get(chat_id)
+    if mid:
         try:
+            await bot_.edit_message_text(text, chat_id=chat_id, message_id=mid)
+            return
+        except BadRequest as error:
+            low = str(error).lower()
+            if "not modified" in low:
+                return
+            if "not found" not in low and "can't be edited" not in low:
+                raise
+    msg = await bot_.send_message(chat_id, text)
+    _pin_ids[chat_id] = msg.message_id
+    try:
+        await bot_.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+    except TelegramError:
+        log.warning("Épinglage impossible dans %s (groupe : le bot doit pouvoir épingler des messages)", chat_id)
+
+
+async def tg_storage_worker(bot_) -> None:
+    """Recopie les abonnements modifiés dans le message épinglé de leur chat."""
+    while True:
+        await asyncio.sleep(3)  # regroupe les modifications rapprochées
+        while _dirty:
+            cid = _dirty.pop()
             try:
-                await bot.edit_message_text(payload, chat_id=_storage_chat(), message_id=_tg_storage_msg_id)
-                _tg_pushed = payload
-            except BadRequest as error:
-                low = str(error).lower()
-                if "not modified" in low:
-                    _tg_pushed = payload
-                elif "not found" in low:
-                    await _tg_create_storage_message(bot, payload)
-                else:
-                    raise
-        except Exception:
-            log.exception("Sauvegarde des abonnements échouée, nouvel essai dans 30 s")
-            await asyncio.sleep(30)
-            _tg_dirty.set()
+                await _tg_save_chat(bot_, cid)
+            except Forbidden:
+                pass  # bot bloqué / retiré du chat
+            except Exception:
+                log.exception("Sauvegarde des abonnements échouée (%s), nouvel essai", cid)
+                _dirty.add(cid)
+                break
+
+
+async def preload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Avant tout handler : charge les abonnements du chat depuis son message épinglé."""
+    if update.effective_chat:
+        await tg_load_chat(context.bot, update.effective_chat.id)
 
 
 # ---------- Envoi : conversion Discord (**gras**) -> HTML Telegram ----------
@@ -1056,14 +1000,14 @@ def to_html(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
 
 
-async def tg_send(bot, chat_id, text: str, reply_markup=None) -> bool:
+async def tg_send(bot_, chat_id, text: str, reply_markup=None) -> bool:
     """Envoie `text` (format bot.py) en HTML, coupé en morceaux si besoin.
     Renvoie False si le chat est inaccessible (bot bloqué / chat supprimé)."""
     parts = _split_long(text, TG_MAX_LEN) or [text]
     for i, part in enumerate(parts):
         markup = reply_markup if i == len(parts) - 1 else None
         try:
-            await bot.send_message(
+            await bot_.send_message(
                 chat_id, to_html(part), parse_mode=ParseMode.HTML,
                 link_preview_options=_NO_PREVIEW, reply_markup=markup,
             )
@@ -1074,7 +1018,7 @@ async def tg_send(bot, chat_id, text: str, reply_markup=None) -> bool:
                 return False
             # HTML refusé : on renvoie en texte brut plutôt que de perdre l'alerte
             try:
-                await bot.send_message(chat_id, part, link_preview_options=_NO_PREVIEW, reply_markup=markup)
+                await bot_.send_message(chat_id, part, link_preview_options=_NO_PREVIEW, reply_markup=markup)
             except TelegramError as error2:
                 log.warning("Envoi échoué vers %s : %s", chat_id, error2)
                 return False
@@ -1112,59 +1056,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await tg_send(context.bot, update.effective_chat.id, MENU_TEXT, _main_markup())
-
-
-async def cmd_stockage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Diagnostic du stockage des abonnements (commande cachée : /stockage)."""
-    chat_id = update.effective_chat.id
-    bot_ = context.bot
-    cid = _storage_chat()
-    lignes = ["🗄️ **Stockage des abonnements**"]
-
-    if cid is None:
-        lignes.append("❌ `TELEGRAM_STORAGE_CHAT_ID` est absent ou vide dans les variables d'environnement.")
-        await tg_send(bot_, chat_id, "\n".join(lignes))
-        return
-    lignes.append("✅ Variable `TELEGRAM_STORAGE_CHAT_ID` définie")
-
-    try:
-        chat = await bot_.get_chat(cid)
-    except TelegramError as error:
-        lignes.append(f"❌ Chat introuvable ou inaccessible : {error}")
-        lignes.append("Vérifie l'id (il commence par -100 pour un canal) et que le bot est administrateur.")
-        await tg_send(bot_, chat_id, "\n".join(lignes))
-        return
-    lignes.append(f"✅ Chat trouvé : {chat.title or chat.type} ({chat.type})")
-
-    manque = []
-    try:
-        member = await bot_.get_chat_member(cid, bot_.id)
-        if member.status not in ("administrator", "creator"):
-            lignes.append(f"❌ Le bot n'est pas administrateur (statut : {member.status})")
-        else:
-            lignes.append("✅ Le bot est administrateur")
-            if chat.type == "channel":
-                if getattr(member, "can_post_messages", True) is False:
-                    manque.append("Publier des messages")
-                if getattr(member, "can_edit_messages", True) is False:
-                    manque.append("Modifier les messages des autres (nécessaire pour épingler)")
-            elif getattr(member, "can_pin_messages", True) is False:
-                manque.append("Épingler des messages")
-            if manque:
-                lignes.append("❌ Droit(s) manquant(s) : " + " ; ".join(manque))
-            else:
-                lignes.append("✅ Droits suffisants")
-    except TelegramError as error:
-        lignes.append(f"❌ Droits du bot illisibles : {error}")
-
-    data = _parse_storage(chat.pinned_message.text) if chat.pinned_message and chat.pinned_message.text else None
-    if data is None:
-        lignes.append("⚠️ Aucun message de stockage épinglé pour l'instant (créé au prochain démarrage du bot)")
-    else:
-        lignes.append(f"✅ Message de stockage épinglé trouvé ({len(data.get('subs', {}))} chat(s) abonné(s))")
-    lignes.append("✅ Persistance active" if _tg_storage_msg_id is not None
-                  else "❌ Persistance inactive dans ce processus (voir les logs de démarrage)")
-    await tg_send(bot_, chat_id, "\n".join(lignes))
 
 
 async def send_traffic(context, chat_id: int, lignes: set[str], single: str | None = None):
@@ -1282,15 +1173,15 @@ async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_lines(context.bot, update.effective_chat.id)
 
 
-async def send_lines(bot, chat_id: int) -> None:
+async def send_lines(bot_, chat_id: int) -> None:
     try:
         disruptions = await fetch_disruptions()
     except Exception as error:
-        await tg_send(bot, chat_id, f"Erreur lors de la récupération des infos trafic : {error}")
+        await tg_send(bot_, chat_id, f"Erreur lors de la récupération des infos trafic : {error}")
         return
 
     if not disruptions:
-        await tg_send(bot, chat_id, "Aucune perturbation en cours sur le réseau ✅")
+        await tg_send(bot_, chat_id, "Aucune perturbation en cours sur le réseau ✅")
         return
 
     perturbees = {d["ligne"] for d in disruptions}
@@ -1307,7 +1198,7 @@ async def send_lines(bot, chat_id: int) -> None:
     cliquables = [l for l in sorted(perturbees, key=_line_sort_key) if not VALID_LINES or l in VALID_LINES]
     boutons = [InlineKeyboardButton(l, callback_data=f"t:{l}") for l in cliquables[:90]]
     rows = [boutons[i:i + 5] for i in range(0, len(boutons), 5)]
-    await tg_send(bot, chat_id, "\n".join(parts), InlineKeyboardMarkup(rows) if rows else None)
+    await tg_send(bot_, chat_id, "\n".join(parts), InlineKeyboardMarkup(rows) if rows else None)
 
 
 # ---------- Menu à boutons ----------
@@ -1491,12 +1382,11 @@ async def tg_initialize_baseline() -> None:
     try:
         disruptions = await fetch_disruptions()
     except Exception as error:
-        log.warning("Initialisation impossible : %s", error)
+        log.warning("Initialisation Telegram impossible : %s", error)
         return
-    state = tg_load_state()
-    state["seen_ids"] = list({d["id"] for d in disruptions})
-    tg_save_state(state)
-    log.info("Initialisation : %d perturbations existantes ignorées.", len(state["seen_ids"]))
+    _tg_seen.clear()
+    _tg_seen.update(d["id"] for d in disruptions)
+    log.info("Initialisation Telegram : %d perturbations existantes ignorées.", len(_tg_seen))
 
 
 async def tg_check_updates(app: Application) -> None:
@@ -1506,68 +1396,51 @@ async def tg_check_updates(app: Application) -> None:
         log.warning("fetch_disruptions : %s", error)
         return
 
-    state = tg_load_state()
-    seen = set(state.get("seen_ids", []))
-    subs = state.get("subs", {})
+    new = [d for d in disruptions if d["id"] not in _tg_seen]
+    _tg_seen.clear()
+    _tg_seen.update(d["id"] for d in disruptions)  # purge : seulement les perturbations en cours
     canal = _channel_id()
-    dead: set[str] = set()
 
-    for d in disruptions:
-        if d["id"] in seen:
-            continue
-        seen.add(d["id"])
-
-        cibles = {cid for cid, lignes in subs.items() if d["ligne"] in lignes}
+    for d in new:
+        cibles = {cid for cid, lignes in _subs.items() if d["ligne"] in lignes}
         if canal is not None:
             cibles.add(canal)
         for cid in cibles:
-            ok = await tg_send(app.bot, cid, d["message"])
-            if not ok and cid in subs:
-                dead.add(cid)
+            if not await tg_send(app.bot, cid, d["message"]):
+                _subs.pop(cid, None)  # chat inaccessible : on l'oublie
             await asyncio.sleep(0.05)
-
-    # Recharge : des /sub ont pu changer pendant les envois
-    state = tg_load_state()
-    state["seen_ids"] = list(seen)
-    for cid in dead:
-        state.get("subs", {}).pop(cid, None)
-    tg_save_state(state)
 
 
 # ---------- Mini serveur web (exigé par Render : port fourni dans la variable PORT) ----------
 
-class _Ping(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, *args):
-        pass
-
-
-def _run_web() -> None:
-    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), _Ping).serve_forever()
-
-
-# ---------- Démarrage ----------
-
-@bot.event
-async def on_ready():
-    if GUILD_ID:
-        guild = discord.Object(id=int(GUILD_ID))
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-    else:
-        await bot.tree.sync()
-
-    print(f"Connecté en tant que {bot.user} — commandes synchronisées")
-    bot.loop.create_task(poll_loop())
+async def _start_web() -> None:
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="OK"))
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
 
 
 # ---------- Démarrage (Discord + Telegram dans un seul processus) ----------
 
-tg_app: Application | None = None
+_poll_task: asyncio.Task | None = None
+
+
+@bot.event
+async def on_ready():
+    global _poll_task
+    if GUILD_ID:
+        guild = discord.Object(id=int(GUILD_ID))
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+    else:
+        await tree.sync()
+
+    log.info("Connecté en tant que %s — commandes synchronisées", bot.user)
+    # on_ready peut se redéclencher à chaque reconnexion : une seule boucle de polling
+    if _poll_task is None or _poll_task.done():
+        _poll_task = asyncio.create_task(poll_loop())
+
 
 TG_COMMANDS = [
     BotCommand("menu", "Menu à boutons"),
@@ -1580,12 +1453,12 @@ TG_COMMANDS = [
 
 def build_tg_app() -> Application:
     app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
+    app.add_handler(TypeHandler(Update, preload), group=-1)  # charge les abonnements du chat
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("traffic", cmd_traffic))
     app.add_handler(CommandHandler("sub", cmd_sub))
     app.add_handler(CommandHandler("lines", cmd_lines))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("stockage", cmd_stockage))
     app.add_handler(CallbackQueryHandler(on_button))
     return app
 
@@ -1602,14 +1475,13 @@ async def check_all(channel: discord.TextChannel) -> None:
 
 async def main_async() -> None:
     global tg_app
-    threading.Thread(target=_run_web, daemon=True).start()
+    await _start_web()
 
     if os.environ.get("TELEGRAM_TOKEN"):
         try:
             tg_app = build_tg_app()
             await tg_app.initialize()
             await tg_app.bot.set_my_commands(TG_COMMANDS)
-            await tg_pull_subs(tg_app.bot)
             tg_app.bot_data["storage_task"] = asyncio.create_task(tg_storage_worker(tg_app.bot))
             await tg_initialize_baseline()
             await tg_app.start()
@@ -1627,6 +1499,8 @@ async def main_async() -> None:
             await tg_app.updater.stop()
             await tg_app.stop()
             await tg_app.shutdown()
+        if _session is not None and not _session.closed:
+            await _session.close()
 
 
 if __name__ == "__main__":
